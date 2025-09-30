@@ -1,0 +1,159 @@
+<?php
+require_once __DIR__ . '/inc/header.php';
+
+function gorev_has(string $col): bool {
+    static $c=[];
+    if(isset($c[$col])) return $c[$col];
+    $row=fetch_one("SHOW COLUMNS FROM gorevler LIKE ?",[$col]);
+    return $c[$col]= (bool)$row;
+}
+function gorev_atanan_kolon(): ?string {
+    if(gorev_has('assigned_user_id')) return 'assigned_user_id';
+    if(gorev_has('atanan_personel_id')) return 'atanan_personel_id';
+    return null;
+}
+$colAtanan = gorev_atanan_kolon();
+
+/* Durum güncelle */
+if (is_post() && ($_POST['act'] ?? '') === 'durum') {
+    csrf_check();
+    $id    = (int)($_POST['id'] ?? 0);
+    $durum = trim($_POST['durum'] ?? '');
+    if ($id>0 && $durum!=='') {
+        $set=['durum=?'];
+        $prm=[$durum];
+        if(gorev_has('updated_at')){ $set[]='updated_at=NOW()'; }
+        $prm[]=$id;
+        $ok=exec_stmt("UPDATE gorevler SET ".implode(',',$set)." WHERE id=?",$prm);
+        flash_set($ok?'success':'error',$ok?'Durum güncellendi.':'Güncelleme başarısız.');
+    } else {
+        flash_set('error','Eksik bilgi.');
+    }
+    redirect(current_path().'?id='.$id);
+}
+
+/* Atama değiştir */
+if (is_post() && ($_POST['act'] ?? '') === 'assign' && $colAtanan) {
+    csrf_check();
+    $id  = (int)($_POST['id'] ?? 0);
+    $uid = (int)($_POST['assigned_user_id'] ?? 0);
+    $set=["$colAtanan=?"];
+    $prm=[$uid?:null];
+    if(gorev_has('updated_at')){ $set[]='updated_at=NOW()'; }
+    $prm[]=$id;
+    $ok=exec_stmt("UPDATE gorevler SET ".implode(',',$set)." WHERE id=?",$prm);
+    flash_set($ok?'success':'error',$ok?'Atama güncellendi.':'Atama güncellenemedi.');
+    redirect(current_path().'?id='.$id);
+}
+
+$id = (int)($_GET['id'] ?? 0);
+$selectAtanan = $colAtanan ? "g.$colAtanan" : "NULL as atanan_personel_id";
+
+$g = fetch_one("
+  SELECT
+    g.*, $selectAtanan,
+    b.ad  AS bina_ad,
+    k.ad  AS kat_ad,
+    bi.ad AS birim_ad,
+    o.ad  AS oda_ad,
+    u.ad  AS atanan_ad,
+    u.telefon AS atanan_tel
+  FROM gorevler g
+  LEFT JOIN binalar  b  ON b.id  = g.bina_id
+  LEFT JOIN katlar   k  ON k.id  = g.kat_id
+  LEFT JOIN birimler bi ON bi.id = g.birim_id
+  LEFT JOIN odalar   o  ON o.id  = g.oda_id
+  LEFT JOIN kullanicilar u ON u.id = ".($colAtanan? "g.$colAtanan":"0")."
+  WHERE g.id=?
+", [$id]);
+
+if(!$g){
+  echo "<div class='alert alert-danger m-3'>Görev bulunamadı.</div>";
+  require_once __DIR__ . '/inc/footer.php';
+  exit;
+}
+
+/* Bağlı şikayet */
+$s = null;
+if (!empty($g['sikayet_id'])) {
+    $s = fetch_one("
+      SELECT s.*,
+             o.ad AS oda_ad,
+             b.ad AS bina_ad,
+             k.ad AS kat_ad,
+             bi.ad AS birim_ad
+      FROM sikayetler s
+      LEFT JOIN odalar o   ON o.id = s.oda_id
+      LEFT JOIN binalar b  ON b.id = o.bina_id
+      LEFT JOIN katlar k   ON k.id = o.kat_id
+      LEFT JOIN birimler bi ON bi.id = o.birim_id
+      WHERE s.id=?
+    ", [$g['sikayet_id']]);
+}
+
+/* Personel seçimi için aktif personeller */
+$personeller = fetch_all("SELECT id, ad, telefon FROM kullanicilar WHERE rol='PERSONEL' AND aktif=1 ORDER BY ad");
+
+?>
+<div class="card card-outline card-info">
+  <div class="card-header">
+    <h3 class="card-title mb-0">Görev #<?php echo h($g['id']); ?></h3>
+  </div>
+  <div class="card-body">
+    <dl class="row mb-0">
+      <dt class="col-sm-3">Başlık</dt><dd class="col-sm-9"><?php echo h($g['baslik']); ?></dd>
+      <dt class="col-sm-3">Konum</dt>
+      <dd class="col-sm-9">
+        <?php echo h(($g['bina_ad']??'-')." / ".($g['kat_ad']??'-')." / ".(($g['birim_ad']??'-')?:'-')." / ".($g['oda_ad']??'-')); ?>
+      </dd>
+      <?php if(gorev_has('durum')): ?>
+      <dt class="col-sm-3">Durum</dt>
+      <dd class="col-sm-9">
+        <form method="post" class="form-inline">
+          <?php echo csrf_field(); ?>
+          <input type="hidden" name="act" value="durum">
+          <input type="hidden" name="id" value="<?php echo (int)$g['id']; ?>">
+          <select name="durum" class="form-control form-control-sm mr-2">
+            <?php foreach(['YENI','DEVAM','ATANDI','TAMAMLANDI','IPTAL'] as $d): ?>
+              <option value="<?php echo h($d); ?>" <?php echo selected($g['durum'],$d); ?>><?php echo h($d); ?></option>
+            <?php endforeach; ?>
+          </select>
+          <button class="btn btn-sm btn-primary">Güncelle</button>
+        </form>
+      </dd>
+      <?php endif; ?>
+      <?php if($colAtanan): ?>
+      <dt class="col-sm-3">Atanan</dt>
+      <dd class="col-sm-9">
+        <form method="post" class="form-inline">
+          <?php echo csrf_field(); ?>
+            <input type="hidden" name="act" value="assign">
+            <input type="hidden" name="id" value="<?php echo (int)$g['id']; ?>">
+            <select name="assigned_user_id" class="form-control form-control-sm mr-2">
+              <option value="">(Yok)</option>
+              <?php foreach($personeller as $p): ?>
+              <option value="<?php echo (int)$p['id']; ?>" <?php echo selected($g[$colAtanan] ?? null,$p['id']); ?>>
+                <?php echo h($p['ad']); ?>
+              </option>
+              <?php endforeach; ?>
+            </select>
+            <button class="btn btn-sm btn-secondary">Kaydet</button>
+        </form>
+      </dd>
+      <?php endif; ?>
+      <?php if(!empty($g['sikayet_id'])): ?>
+      <dt class="col-sm-3">Şikayet</dt>
+      <dd class="col-sm-9">
+        #<?php echo (int)$g['sikayet_id']; ?>
+        <?php if($s): ?>
+          - <?php echo h(mb_strimwidth($s['mesaj'],0,60,'…','UTF-8')); ?>
+        <?php endif; ?>
+      </dd>
+      <?php endif; ?>
+    </dl>
+  </div>
+  <div class="card-footer text-right">
+    <a href="<?php echo h(app_url('yonetim/gorevler.php')); ?>" class="btn btn-sm btn-secondary">&larr; Liste</a>
+  </div>
+</div>
+<?php require_once __DIR__ . '/inc/footer.php'; ?>

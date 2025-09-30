@@ -1,0 +1,34 @@
+<?php
+require_once __DIR__.'/../ortak/oturum.php';
+require_once __DIR__.'/../ortak/db_helpers.php';
+require_once __DIR__.'/../ortak/guvenlik.php';
+require_once __DIR__.'/../ortak/yetki.php';
+require_role(['GENEL','MUDUR']);
+
+header('Content-Type: application/json; charset=utf-8');
+
+$kat_id = (int)($_GET['kat_id'] ?? 0);
+if($kat_id <= 0){
+    echo json_encode(['ok'=>true,'data'=>[]]);
+    exit;
+}
+
+/*
+ * Kat bazlı birimler: odalar üzerinden DISTINCT birim_id (NULL olmayan).
+ * Yoksa fallback tüm birimler.
+ */
+$birimler = fetch_all("
+    SELECT DISTINCT b.id, b.ad
+    FROM odalar o
+    JOIN birimler b ON b.id=o.birim_id
+    WHERE o.kat_id=? AND o.birim_id IS NOT NULL
+    ORDER BY b.ad
+",[$kat_id]);
+
+if(!$birimler){
+    // fallback (tüm birimler)
+    $birimler = fetch_all("SELECT id, ad FROM birimler ORDER BY ad");
+    echo json_encode(['ok'=>true,'data'=>$birimler,'fallback'=>true]);
+} else {
+    echo json_encode(['ok'=>true,'data'=>$birimler,'fallback'=>false]);
+}

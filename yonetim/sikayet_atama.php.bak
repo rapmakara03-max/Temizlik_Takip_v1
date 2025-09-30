@@ -1,0 +1,425 @@
+<?php
+require_once __DIR__ . '/inc/header.php';
+require_once __DIR__ . '/../ortak/sms_netgsm.php';
+
+/*
+  Bu sayfada, atama sırasında yaşanan hatanın sebebini kullanıcıya gösterecek
+  detaylı bir tanılama (debug) bloğu eklendi.
+  Ayrıca gorevler şemasındaki kolonların varlığı dinamik olarak kontrol edilir
+  ve sadece var olan kolonlar üzerinden INSERT/UPDATE yapılır (sikayet_id dahil).
+*/
+
+// Yardımcılar
+function first_nonempty(array $arr, array $keys): string {
+    foreach ($keys as $k) {
+        if (isset($arr[$k]) && trim((string)$arr[$k]) !== '') return (string)$arr[$k];
+    }
+    return '';
+}
+function foto_url($v): string {
+    if (!$v) return '';
+    $v = (string)$v;
+    if (preg_match('~^https?://~i', $v)) return $v;
+    if (str_starts_with($v, '/')) return $v;
+    return app_url('uploads/'.$v);
+}
+function gorevler_has(string $col): bool {
+    static $cache = [];
+    if (array_key_exists($col, $cache)) return $cache[$col];
+    $row = fetch_one("SHOW COLUMNS FROM gorevler LIKE ?", [$col]);
+    $cache[$col] = $row ? true : false;
+    return $cache[$col];
+}
+// Veritabanından olası son hata metnini yakalamaya çalış
+function db_last_error_text(): string {
+    try {
+        if (isset($GLOBALS['db']) && $GLOBALS['db'] instanceof PDO) {
+            $ei = $GLOBALS['db']->errorInfo();
+            if (is_array($ei) && !empty($ei[2])) return (string)$ei[2];
+        }
+        if (isset($GLOBALS['pdo']) && $GLOBALS['pdo'] instanceof PDO) {
+            $ei = $GLOBALS['pdo']->errorInfo();
+            if (is_array($ei) && !empty($ei[2])) return (string)$ei[2];
+        }
+        if (isset($GLOBALS['db']) && is_object($GLOBALS['db']) && method_exists($GLOBALS['db'], 'error')) {
+            $e = (string)$GLOBALS['db']->error;
+            if ($e !== '') return $e;
+        }
+        $w = fetch_all("SHOW WARNINGS", []);
+        if ($w) {
+            $lines = [];
+            foreach ($w as $row) {
+                if (isset($row['Message'])) $lines[] = $row['Message'];
+                elseif (isset($row['message'])) $lines[] = $row['message'];
+            }
+            if ($lines) return implode(" | ", $lines);
+        }
+    } catch (Throwable $e) {
+        return 'Diagnostik hata: '.$e->getMessage();
+    }
+    return '';
+}
+
+// Şikayet verisini çek
+$sid = (int)($_GET['id'] ?? 0);
+$sikayet = fetch_one("
+    SELECT s.*,
+           o.id  AS oda_id,  o.ad  AS oda_ad,
+           b.id  AS bina_id, b.ad  AS bina_ad,
+           k.id  AS kat_id,  k.ad  AS kat_ad,
+           bi.id AS birim_id, bi.ad AS birim_ad
+    FROM sikayetler s
+    LEFT JOIN odalar   o  ON o.id  = s.oda_id
+    LEFT JOIN binalar  b  ON b.id  = o.bina_id
+    LEFT JOIN katlar   k  ON k.id  = o.kat_id
+    LEFT JOIN birimler bi ON bi.id = o.birim_id
+    WHERE s.id = ?
+", [$sid]);
+
+if (!$sikayet) {
+    echo "<div class='alert alert-danger m-3'>Şikayet bulunamadı.</div>";
+    require_once __DIR__ . '/inc/footer.php';
+    exit;
+}
+
+// Şikayet detayları (görünüm için)
+$konum = trim(implode(' / ', array_filter([
+    $sikayet['bina_ad']  ?? '',
+    $sikayet['kat_ad']   ?? '',
+    $sikayet['birim_ad'] ?? '',
+    $sikayet['oda_ad']   ?? '',
+])));
+$sikayet_eden = first_nonempty($sikayet, ['sikayet_eden', 'ad', 'isim', 'adi', 'adsoyad', 'ad_soyad']);
+$sikayet_tel  = first_nonempty($sikayet, ['telefon', 'tel', 'gsm']);
+$sikayet_not  = first_nonempty($sikayet, ['not', 'aciklama', 'mesaj', 'icerik', 'detay']);
+$fotos = [];
+foreach (['foto1','foto2','foto_1','foto_2','resim1','resim2','ek1','ek2','foto'] as $k) {
+    if (!empty($sikayet[$k])) $fotos[] = foto_url($sikayet[$k]);
+}
+
+// Hata/Debug gösterimi için değişkenler
+$inline_error = '';
+$inline_debug = [];
+
+if (is_post()) {
+    csrf_check();
+
+    $pid = (int)($_POST['personel_id'] ?? 0);
+    // Personel seçilmemiş veya eksik ise bile atamayı engellemeyelim.
+    $personel = $pid > 0 ? fetch_one("SELECT id, ad, telefon FROM kullanicilar WHERE id=? LIMIT 1", [$pid]) : null;
+    if (!$personel) {
+        $personel = ['id'=>null, 'ad'=>null, 'telefon'=>null];
+        $inline_debug[] = 'Uyarı: Personel bilgisi bulunamadı veya seçilmedi. assigned_user_id boş bırakılacak.';
+    }
+
+    // gorevler tablosunda sikayet_id kolonu var mı?
+    $hasSikayetCol = gorevler_has('sikayet_id');
+
+    // Var olan bir görev var mı?
+    $gorev = null;
+    if ($hasSikayetCol) {
+        $gorev = fetch_one("SELECT id FROM gorevler WHERE sikayet_id=? LIMIT 1", [$sid]);
+    } else {
+        $inline_debug[] = "Bilgi: gorevler tablosunda 'sikayet_id' kolonu yok. Mevcut görev araması atlandı.";
+    }
+
+    $ok = false;
+
+    try {
+        if ($gorev) {
+            // Güncelle
+            $updated = false;
+
+            // assigned_user_id varsa ve personel id mevcutsa set et (updated_at varsa ekle)
+            if (gorevler_has('assigned_user_id') && $personel['id'] !== null) {
+                $setParts = ['assigned_user_id=?'];
+                $params   = [$personel['id']];
+                if (gorevler_has('updated_at')) {
+                    $setParts[] = 'updated_at=NOW()';
+                }
+                $sql = "UPDATE gorevler SET ".implode(', ',$setParts)." WHERE id=?";
+                $params[] = $gorev['id'];
+
+                $ok = exec_stmt($sql, $params);
+                $updated = $updated || $ok;
+                if (!$ok) $inline_debug[] = "DEBUG: assigned_user_id güncellenemedi. Hata: ".db_last_error_text();
+            }
+
+            // durum kolonu varsa 'ATANDI' yap (updated_at varsa ekle)
+            if (gorevler_has('durum')) {
+                $setParts = ['durum=?'];
+                $params   = ['ATANDI'];
+                if (gorevler_has('updated_at')) {
+                    $setParts[] = 'updated_at=NOW()';
+                }
+                $sql = "UPDATE gorevler SET ".implode(', ',$setParts)." WHERE id=?";
+                $params[] = $gorev['id'];
+
+                $ok2 = exec_stmt($sql, $params);
+                $updated = $updated || $ok2;
+                if (!$ok2) $inline_debug[] = "DEBUG: durum güncellenemedi. Hata: ".db_last_error_text();
+            }
+
+            // Eğer hiçbirini güncelleyemediysek, sadece updated_at var ise güncelle
+            if (!$updated) {
+                if (gorevler_has('updated_at')) {
+                    $ok3 = exec_stmt("UPDATE gorevler SET updated_at=NOW() WHERE id=?", [$gorev['id']]);
+                    $ok = $ok3;
+                    if (!$ok3) $inline_debug[] = "DEBUG: updated_at güncellenemedi. Hata: ".db_last_error_text();
+                } else {
+                    // updated_at kolonu yoksa ve diğer setler de yapılamadıysa yine de OK saymayalım
+                    $ok = false;
+                    $inline_debug[] = "Bilgi: Güncellenecek kolon bulunamadı (durum/assigned_user_id yok).";
+                }
+            } else {
+                $ok = true;
+            }
+        } else {
+            // INSERT — sadece mevcut kolonlara göre dinamik derle
+            $cols = [];
+            $ph   = [];
+            $vals = [];
+
+            if (gorevler_has('baslik')) { $cols[]='baslik'; $ph[]='?'; $vals[]="Şikayet #".$sid; }
+            if (gorevler_has('durum'))  { $cols[]='durum';  $ph[]='?'; $vals[]='ATANDI'; }
+
+            if ($hasSikayetCol) { $cols[]='sikayet_id'; $ph[]='?'; $vals[]=$sid; }
+
+            if (gorevler_has('assigned_user_id') && $personel['id'] !== null) {
+                $cols[]='assigned_user_id'; $ph[]='?'; $vals[]=$personel['id'];
+            }
+
+            // Konum kolonları varsa ve değerleri mevcutsa ekle
+            $locMap = [
+                'bina_id'  => $sikayet['bina_id']  ?? null,
+                'kat_id'   => $sikayet['kat_id']   ?? null,
+                'birim_id' => $sikayet['birim_id'] ?? null,
+                'oda_id'   => $sikayet['oda_id']   ?? null,
+            ];
+            foreach ($locMap as $col => $val) {
+                if (gorevler_has($col) && $val !== null) {
+                    $cols[]=$col; $ph[]='?'; $vals[]=$val;
+                }
+            }
+
+            // Zaman kolonlarını sadece varsa ekle
+            if (gorevler_has('created_at')) { $cols[]='created_at'; $ph[]='NOW()'; }
+            if (gorevler_has('updated_at')) { $cols[]='updated_at'; $ph[]='NOW()'; }
+
+            if (empty($cols)) {
+                $inline_debug[] = "HATA: gorevler tablosunda eklenebilecek uygun kolon bulunamadı. Lütfen şema kontrol edin.";
+                $ok = false;
+            } else {
+                // NOW() placeholder değildir; parametre dizinini ona göre oluştur
+                $sqlPh = [];
+                $bindVals = [];
+                $valIdx = 0;
+                foreach ($ph as $p) {
+                    if ($p === 'NOW()') {
+                        $sqlPh[] = 'NOW()';
+                    } else {
+                        $sqlPh[] = '?';
+                        $bindVals[] = $vals[$valIdx++];
+                    }
+                }
+                $sql = "INSERT INTO gorevler (".implode(',', $cols).") VALUES (".implode(',', $sqlPh).")";
+                $ok = exec_stmt($sql, $bindVals);
+
+                if (!$ok) {
+                    $inline_debug[] = "DEBUG: INSERT başarısız. SQL: ".$sql;
+                    $inline_debug[] = "DEBUG: Parametreler: ".json_encode($bindVals, JSON_UNESCAPED_UNICODE);
+                    $inline_debug[] = "DEBUG: Veritabanı hatası: ".db_last_error_text();
+
+                    // Gerekli (NOT NULL, default'suz) kolonları tespit et
+                    $colsMeta = fetch_all("SHOW COLUMNS FROM gorevler", []);
+                    if ($colsMeta) {
+                        $provided = array_flip($cols);
+                        $missingRequired = [];
+                        foreach ($colsMeta as $cm) {
+                            $field = $cm['Field'] ?? '';
+                            $null  = strtoupper((string)($cm['Null'] ?? ''));
+                            $def   = $cm['Default'] ?? null;
+                            $extra = strtolower((string)($cm['Extra'] ?? ''));
+                            if ($field === 'id' && str_contains($extra,'auto_increment')) continue;
+                            if ($null === 'NO' && $def === null && !isset($provided[$field])) {
+                                $missingRequired[] = $field;
+                            }
+                        }
+                        if ($missingRequired) {
+                            $inline_debug[] = "Muhtemel eksik (NOT NULL) kolonlar: ".implode(', ', $missingRequired);
+                            $inline_debug[] = "Lütfen bu kolonlara uygun varsayılan değer tanımlayın veya kodu bu kolonları set edecek şekilde uyarlayın.";
+                        }
+                    }
+                    // Minimum ekleme: sadece mevcut baslik/durum ile dene
+                    if (!$ok) {
+                        if (gorevler_has('durum') && !gorevler_has('baslik')) {
+                            $cols = ['durum']; $vals=['ATANDI']; $ph=['?'];
+                            if (gorevler_has('created_at')) { $cols[]='created_at'; $ph[]='NOW()'; }
+                            if (gorevler_has('updated_at')) { $cols[]='updated_at'; $ph[]='NOW()'; }
+                            $sqlPh = [];
+                            $bindVals = [];
+                            $vi=0;
+                            foreach($ph as $p){
+                                if($p==='NOW()') $sqlPh[]='NOW()';
+                                else { $sqlPh[]='?'; $bindVals[]=$vals[$vi++]; }
+                            }
+                            $sql = "INSERT INTO gorevler (".implode(',', $cols).") VALUES (".implode(',', $sqlPh).")";
+                            $ok = exec_stmt($sql, $bindVals);
+                        } elseif (gorevler_has('baslik')) {
+                            $cols = ['baslik']; $vals=["Şikayet #".$sid]; $ph=['?'];
+                            if (gorevler_has('created_at')) { $cols[]='created_at'; $ph[]='NOW()'; }
+                            if (gorevler_has('updated_at')) { $cols[]='updated_at'; $ph[]='NOW()'; }
+                            $sqlPh = [];
+                            $bindVals = [];
+                            $vi=0;
+                            foreach($ph as $p){
+                                if($p==='NOW()') $sqlPh[]='NOW()';
+                                else { $sqlPh[]='?'; $bindVals[]=$vals[$vi++]; }
+                            }
+                            $sql = "INSERT INTO gorevler (".implode(',', $cols).") VALUES (".implode(',', $sqlPh).")";
+                            $ok = exec_stmt($sql, $bindVals);
+                        }
+                        if (!$ok) {
+                            $inline_debug[] = "DEBUG: Minimum ekleme denemesi de başarısız oldu. Hata: ".db_last_error_text();
+                        }
+                    }
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        $ok = false;
+        $inline_debug[] = 'İstisna: '.$e->getMessage();
+    }
+
+    if ($ok) {
+        // SMS bildirimi (telefon varsa, başarısız olsa da akışı kesme)
+        if (!empty($personel['telefon'])) {
+            $mesaj = ($konum !== '' ? "$konum konumunda " : "") .
+                     "tarafınıza şikayet çözüm talebi atanmıştır. Lütfen ilgili odaya giderek işlemi gerçekleştirin";
+            $sent = send_sms((string)$personel['telefon'], $mesaj);
+            if (!$sent) $inline_debug[] = 'Uyarı: SMS gönderilemedi (logları kontrol edin).';
+        }
+        flash_set('success', 'Atama başarıyla kaydedildi.');
+        redirect(app_url('yonetim/sikayetler.php'));
+    } else {
+        // Yönlendirme yapmadan aynı sayfada hatayı ve detayları göster
+        $inline_error = 'Atama kaydedilemedi. Aşağıdaki tanılama çıktısını kontrol edin.';
+    }
+}
+
+// Personel arama
+$q = trim($_GET['q'] ?? '');
+$params = [];
+$where = " WHERE rol='PERSONEL' AND aktif=1 ";
+if ($q !== '') {
+    $where .= " AND (ad LIKE ? OR email LIKE ? OR telefon LIKE ?) ";
+    $like = "%$q%";
+    $params = [$like, $like, $like];
+}
+$personeller = fetch_all("SELECT id, ad, email, telefon, gorevi, sorumlu_bolge FROM kullanicilar $where ORDER BY ad LIMIT 50", $params);
+?>
+<div class="card card-outline card-primary">
+  <div class="card-header">
+    <h3 class="card-title mb-0">Şikayet Atama</h3>
+    <div class="card-tools">
+      <a class="btn btn-sm btn-secondary" href="<?php echo h(app_url('yonetim/sikayetler.php')); ?>">← Geri</a>
+    </div>
+  </div>
+  <div class="card-body">
+    <?php if ($inline_error): ?>
+      <div class="alert alert-danger">
+        <?php echo h($inline_error); ?>
+        <?php if ($inline_debug): ?>
+          <details class="mt-2">
+            <summary>Ayrıntıları göster</summary>
+            <ul class="mt-2 mb-0">
+              <?php foreach ($inline_debug as $d): ?>
+                <li><code><?php echo h($d); ?></code></li>
+              <?php endforeach; ?>
+            </ul>
+          </details>
+        <?php endif; ?>
+      </div>
+    <?php endif; ?>
+
+    <div class="mb-3">
+      <h5 class="mb-2">Şikayet Detayı</h5>
+      <dl class="row mb-0">
+        <dt class="col-sm-3">Konumu</dt>
+        <dd class="col-sm-9"><?php echo h($konum !== '' ? $konum : '-'); ?></dd>
+
+        <dt class="col-sm-3">Şikayet Eden İsim</dt>
+        <dd class="col-sm-9"><?php echo h($sikayet_eden !== '' ? $sikayet_eden : '-'); ?></dd>
+
+        <dt class="col-sm-3">Telefon</dt>
+        <dd class="col-sm-9">
+          <?php if($sikayet_tel !== ''): ?>
+            <a href="tel:<?php echo h($sikayet_tel); ?>"><?php echo h($sikayet_tel); ?></a>
+          <?php else: ?>
+            <span class="text-muted">-</span>
+          <?php endif; ?>
+        </dd>
+
+        <dt class="col-sm-3">Not</dt>
+        <dd class="col-sm-9"><div class="border rounded p-2 bg-light" style="white-space:pre-wrap;"><?php echo h($sikayet_not !== '' ? $sikayet_not : '-'); ?></div></dd>
+
+        <dt class="col-sm-3">Fotoğraflar</dt>
+        <dd class="col-sm-9">
+          <?php if($fotos): ?>
+            <?php foreach($fotos as $i=>$url): ?>
+              <a class="btn btn-xs btn-outline-primary mr-1 mb-1" target="_blank" href="<?php echo h($url); ?>">Foto <?php echo $i+1; ?></a>
+            <?php endforeach; ?>
+          <?php else: ?>
+            <span class="text-muted">Yok</span>
+          <?php endif; ?>
+        </dd>
+      </dl>
+      <hr>
+    </div>
+
+    <form method="get" class="mb-3">
+      <input type="hidden" name="id" value="<?php echo (int)$sid; ?>">
+      <div class="input-group">
+        <input type="text" class="form-control" name="q" placeholder="Personel ara (ad, email, telefon)" value="<?php echo h($q); ?>">
+        <button class="btn btn-outline-secondary" type="submit">Ara</button>
+      </div>
+    </form>
+
+    <form method="post">
+      <?php echo csrf_field(); ?>
+      <input type="hidden" name="id" value="<?php echo (int)$sid; ?>">
+
+      <div class="table-responsive">
+        <table class="table table-sm table-hover">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Personel</th>
+              <th>E-posta</th>
+              <th>Telefon</th>
+              <th>Görevi</th>
+              <th>Sorumlu Bölge</th>
+            </tr>
+          </thead>
+          <tbody>
+            <?php foreach ($personeller as $p): ?>
+              <tr>
+                <td><input type="radio" name="personel_id" value="<?php echo (int)$p['id']; ?>" required></td>
+                <td><?php echo h($p['ad']); ?></td>
+                <td><?php echo h($p['email']); ?></td>
+                <td><?php echo h($p['telefon'] ?? ''); ?></td>
+                <td><?php echo h($p['gorevi'] ?? ''); ?></td>
+                <td><?php echo h($p['sorumlu_bolge'] ?? ''); ?></td>
+              </tr>
+            <?php endforeach; if(!$personeller): ?>
+              <tr><td colspan="6" class="text-muted">Sonuç yok.</td></tr>
+            <?php endif; ?>
+          </tbody>
+        </table>
+      </div>
+
+      <button class="btn btn-primary">Atamayı Kaydet ve SMS Gönder</button>
+    </form>
+  </div>
+</div>
+<?php require_once __DIR__ . '/inc/footer.php'; ?>

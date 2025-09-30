@@ -1,0 +1,435 @@
+<?php
+/*
+  QR Personel Temizlik Formu (GÜNCELLENMİŞ SON HÂL)
+  Yapılan düzenlemeler:
+  - PERSONEL değilse sessiz redirect (eski "Yetkisiz." flash kaldırıldı).
+  - QR süresi bitmişse hata flash + ana sayfaya dönüş aynı kaldı.
+  - Foto 1 zorunlu, 15MB limit ve basit watermark (kullanıcı & oda & zaman).
+  - Son 10 kayıt listesi.
+  - Personele atanmış AÇIK (tamamlanmamış) görevler ve şikayet kaynaklı görevler listelenir.
+  - Odaya ait açık görevler ayrıca gösterilir.
+  - gorevler tablosundaki atama kolonu ister 'assigned_user_id' ister 'atanan_personel_id' olsun otomatik algılanır.
+  - Görev durum kolonları olmayabilir (şemasal esneklik) → korumalı kontroller.
+  - Kodun önceki sürümündeki “Yetkisiz.” flash mesajı çıkarıldı; kullanıcı login değilse index’e yönleniyor.
+*/
+
+require_once __DIR__ . '/ortak/oturum.php';
+require_once __DIR__ . '/ortak/sabitler.php';
+require_once __DIR__ . '/ortak/yetki.php';
+require_once __DIR__ . '/ortak/csrf.php';
+require_once __DIR__ . '/ortak/db_helpers.php';
+require_once __DIR__ . '/ortak/guvenlik.php';
+
+if (isset($_GET['cikis'])) {
+    session_unset();
+    session_destroy();
+    header('Location: index.php');
+    exit;
+}
+
+$u = current_user();
+if (!$u || $u['rol'] !== 'PERSONEL') {
+    // Sessizce ana sayfaya (login sürecine) gönder.
+    redirect(app_url());
+}
+
+$qrSession = $_SESSION['qr_ok'] ?? null;
+if (!$qrSession || time() > ($qrSession['exp'] ?? 0)) {
+    unset($_SESSION['qr_ok']);
+    flash_set('error', 'QR süresi doldu.');
+    redirect(app_url());
+}
+
+$odaId = ($qrSession['scope'] === 'oda') ? ($qrSession['scope_id'] ?? 0) : ($qrSession['oda_id'] ?? 0);
+$odaId = (int)$odaId;
+if ($odaId <= 0) {
+    flash_set('error', 'Oda seçimi yok.');
+    redirect(app_url());
+}
+
+$oda = fetch_one("
+    SELECT o.*, b.ad bina_ad, k.ad kat_ad, bi.ad birim_ad
+    FROM odalar o
+    LEFT JOIN binalar b ON b.id=o.bina_id
+    LEFT JOIN katlar k ON k.id=o.kat_id
+    LEFT JOIN birimler bi ON bi.id=o.birim_id
+    WHERE o.id=?
+", [$odaId]);
+
+if (!$oda) {
+    flash_set('error', 'Oda bulunamadı.');
+    redirect(app_url());
+}
+
+/* Kayıt Gönderimi */
+if (is_post()) {
+    csrf_check();
+
+    if ((int)($_POST['oda_id'] ?? 0) !== $odaId) {
+        flash_set('error', 'Oda manipülasyonu.');
+        redirect(app_url('qr_form.php'));
+    }
+
+    if (empty($_FILES['foto1']['name'])) {
+        flash_set('error', 'Birinci fotoğraf zorunludur.');
+        redirect(app_url('qr_form.php'));
+    }
+
+    $optsAllowed = ['zemin','cam','cop','toz','dezenfeksiyon'];
+    $secimler = $_POST['secimler'] ?? [];
+    if (!is_array($secimler)) $secimler = [];
+    $isaretler = implode(',', array_intersect($secimler, $optsAllowed));
+    $aciklama = trim($_POST['aciklama'] ?? '');
+
+    // Upload dizini
+    $baseUpload = rtrim(getenv('UPLOAD_DIR') ?: __DIR__ . '/uploads', '/');
+    $temizlikDir = $baseUpload . '/temizlik';
+    if (!is_dir($temizlikDir)) @mkdir($temizlikDir, 0775, true);
+
+    $paths = [null, null];
+    for ($i = 1; $i <= 2; $i++) {
+        if (!empty($_FILES["foto$i"]['name']) && $_FILES["foto$i"]['error'] === UPLOAD_ERR_OK) {
+            if ($_FILES["foto$i"]['size'] > 15 * 1024 * 1024) {
+                flash_set('error', "Fotoğraf $i boyutu çok büyük (max 15MB).");
+                redirect(app_url('qr_form.php'));
+            }
+            $fname = 'tk_' . date('Ymd_His') . '_' . $u['id'] . '_' . $i . '_' . bin2hex(random_bytes(4)) . '.jpg';
+            $dest  = $temizlikDir . '/' . $fname;
+            $tmp   = $_FILES["foto$i"]['tmp_name'];
+
+            $wm = "USER:{$u['id']} ODA:$odaId " . date('Y-m-d H:i:s');
+            $done = false;
+            if (function_exists('imagecreatefromstring')) {
+                $data = @file_get_contents($tmp);
+                $im = @imagecreatefromstring($data);
+                if ($im) {
+                    $black = imagecolorallocatealpha($im, 0, 0, 0, 60);
+                    $h = imagesy($im);
+                    imagestring($im, 3, 10, $h - 15, $wm, $black);
+                    imagejpeg($im, $dest, 85);
+                    imagedestroy($im);
+                    $done = true;
+                }
+            }
+            if (!$done) {
+                @move_uploaded_file($tmp, $dest);
+            }
+            $paths[$i - 1] = 'temizlik/' . $fname;
+        } elseif ($i === 1) {
+            flash_set('error', 'Birinci foto yüklenemedi.');
+            redirect(app_url('qr_form.php'));
+        }
+    }
+
+    $sql = "INSERT INTO temizlik_kayitlari
+            (oda_id, personel_id, tarih, foto_yol, foto_yol2, aciklama, isaretler)
+            VALUES (?,?,NOW(),?,?,?,?)";
+    $params = [$odaId, $u['id'], $paths[0], $paths[1], $aciklama, $isaretler];
+    $ok = exec_stmt($sql, $params);
+
+    if ($ok) {
+        flash_set('success', 'Kayıt eklendi.');
+    } else {
+        if (function_exists('db')) {
+            try {
+                $pdo = db();
+                if ($pdo) {
+                    $err = $pdo->errorInfo();
+                    error_log('Temizlik kaydı INSERT hata: ' . json_encode([
+                        'sql' => $sql, 'params' => $params, 'error' => $err
+                    ], JSON_UNESCAPED_UNICODE));
+                }
+            } catch (Throwable $e) {
+                error_log('Temizlik kaydı hata (pdo erişimi): ' . $e->getMessage());
+            }
+        }
+        flash_set('error', 'Kayıt başarısız.');
+    }
+    redirect(app_url('qr_form.php'));
+}
+
+/* Son 10 Kayıt */
+$sonKayitlar = fetch_all("
+  SELECT id, tarih, aciklama, isaretler
+  FROM temizlik_kayitlari
+  WHERE personel_id=? AND oda_id=?
+  ORDER BY tarih DESC
+  LIMIT 10
+", [$u['id'], $odaId]);
+
+/* Görev / Şikayet Dinamik Fonksiyonları */
+function gorevler_has(string $col): bool {
+    static $cache = [];
+    if (array_key_exists($col, $cache)) return $cache[$col];
+    $row = fetch_one("SHOW COLUMNS FROM gorevler LIKE ?", [$col]);
+    return $cache[$col] = (bool)$row;
+}
+function gorevler_assigned_col(): ?string {
+    if (gorevler_has('assigned_user_id')) return 'assigned_user_id';
+    if (gorevler_has('atanan_personel_id')) return 'atanan_personel_id';
+    return null;
+}
+function gorev_is_aktif(?string $d): bool {
+    if ($d === null || $d === '') return true;
+    return !in_array($d, ['TAMAMLANDI','IPTAL','KAPALI','TAMAM'], true);
+}
+
+$hasDurum    = gorevler_has('durum');
+$hasOdaId    = gorevler_has('oda_id');
+$assignedCol = gorevler_assigned_col();
+
+/* Odaya ait aktif görevler */
+$gorevler = [];
+if ($hasOdaId) {
+    $sel = "SELECT g.id, g.baslik" . ($hasDurum ? ", g.durum" : "") . " FROM gorevler g WHERE g.oda_id=?";
+    $prm = [$odaId];
+    if ($hasDurum) $sel .= " AND g.durum NOT IN ('TAMAMLANDI','IPTAL','KAPALI','TAMAM')";
+    $sel .= " ORDER BY g.id DESC";
+    $gorevler = fetch_all($sel, $prm);
+}
+
+/* Personele atanmış görevler / şikayet görevleri */
+$atananGorevler = [];
+$atananSikayetler = [];
+$atananGorevlerHata = '';
+$atananSikayetlerHata = '';
+
+if ($assignedCol) {
+    // Şikayet olmayan görevler
+    $sel = "SELECT g.id, g.baslik" . ($hasDurum ? ", g.durum" : "") . ($hasOdaId ? ", o.ad AS oda_ad" : "")
+         . " FROM gorevler g"
+         . ($hasOdaId ? " LEFT JOIN odalar o ON o.id=g.oda_id" : "")
+         . " WHERE g.$assignedCol=?";
+    $prm = [$u['id']];
+    if (gorevler_has('sikayet_id')) $sel .= " AND (g.sikayet_id IS NULL OR g.sikayet_id=0)";
+    if ($hasDurum) $sel .= " AND g.durum NOT IN ('TAMAMLANDI','IPTAL','KAPALI','TAMAM')";
+    $sel .= " ORDER BY g.id DESC";
+    $atananGorevler = fetch_all($sel, $prm);
+
+    // Şikayet kaynaklı görevler
+    if (gorevler_has('sikayet_id')) {
+        $sel = "SELECT g.id, g.baslik" . ($hasDurum ? ", g.durum" : "") . ", s.mesaj AS sikayet_aciklama"
+             . ($hasOdaId ? ", o.ad AS oda_ad" : "")
+             . " FROM gorevler g"
+             . " INNER JOIN sikayetler s ON s.id=g.sikayet_id"
+             . ($hasOdaId ? " LEFT JOIN odalar o ON o.id=g.oda_id" : "")
+             . " WHERE g.$assignedCol=? AND g.sikayet_id IS NOT NULL";
+        $prm = [$u['id']];
+        if ($hasDurum) $sel .= " AND g.durum NOT IN ('TAMAMLANDI','IPTAL','KAPALI','TAMAM')";
+        $sel .= " ORDER BY g.id DESC";
+        $atananSikayetler = fetch_all($sel, $prm);
+    } else {
+        $atananSikayetlerHata = "Şikayet listesi desteklenmiyor: gorevler.sikayet_id kolonu yok.";
+    }
+} else {
+    $atananGorevlerHata = "Atama kolonu bulunamadı (assigned_user_id / atanan_personel_id).";
+    $atananSikayetlerHata = $atananGorevlerHata;
+}
+?>
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>Temizlik Kaydı</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:Arial,sans-serif;background:#f1f1f1;margin:0;padding:20px;}
+.container{max-width:780px;margin:0 auto;}
+.card{background:#fff;border-radius:10px;box-shadow:0 4px 14px rgba(0,0,0,0.12);padding:20px 22px;margin-bottom:25px;}
+.card h1{margin:0 0 15px;font-size:22px;color:#333;}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:12px;}
+.chk{background:#fafafa;border:1px solid #ccc;padding:8px 10px;border-radius:6px;display:flex;align-items:center;font-size:13px;cursor:pointer;gap:6px;}
+.chk input{transform:scale(1.1);}
+textarea{width:100%;min-height:90px;resize:vertical;padding:10px;border:1px solid #bbb;border-radius:6px;font-size:14px;}
+input[type=file]{width:100%;padding:8px;border:1px solid #bbb;border-radius:6px;background:#fff;font-size:13px;}
+.btn{display:inline-block;padding:10px 16px;border:none;border-radius:6px;background:#0d6efd;color:#fff;font-weight:600;cursor:pointer;font-size:13px;text-decoration:none;text-align:center;}
+.btn.danger{background:#a40000;}
+.flash{padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:15px;}
+.flash.success{background:#e6ffec;border:1px solid #9ad7aa;}
+.flash.error{background:#ffe5e5;border:1px solid #ff9d9d;}
+.meta{background:#fff;border:1px solid #ddd;padding:10px 14px;border-radius:8px;font-size:12px;margin-bottom:20px;line-height:1.5;}
+.table{width:100%;border-collapse:collapse;font-size:12px;}
+.table th,.table td{border:1px solid #ddd;padding:6px;vertical-align:top;text-align:left;}
+.table th{background:#f5f5f5;}
+.small{font-size:12px;color:#666;}
+.actions{display:flex;gap:8px;flex-wrap:wrap;}
+.muted{color:#777;font-size:12px;}
+.badge{display:inline-block;background:#555;color:#fff;padding:2px 6px;font-size:11px;border-radius:4px;margin:0 2px 2px 0;}
+</style>
+</head>
+<body>
+<div class="container">
+  <?php foreach(flash_get_all() as $f): ?>
+    <div class="flash <?php echo h($f['t']); ?>"><?php echo h($f['m']); ?></div>
+  <?php endforeach; ?>
+
+  <div class="meta">
+    <strong>Konum:</strong>
+    <?php echo h($oda['bina_ad']); ?> / <?php echo h($oda['kat_ad']); ?> / <?php echo h($oda['birim_ad'] ?: '-'); ?> / <?php echo h($oda['ad']); ?><br>
+    <strong>Kullanıcı:</strong> <?php echo h($u['ad']); ?> (<?php echo h($u['email']); ?>)<br>
+    QR Bitiş: <?php echo date('H:i:s', $qrSession['exp']); ?>
+  </div>
+
+  <div class="card">
+    <h1>Temizlik Kaydı</h1>
+    <form method="post" enctype="multipart/form-data">
+      <?php echo csrf_field(); ?>
+      <input type="hidden" name="oda_id" value="<?php echo h($odaId); ?>">
+      <div class="grid">
+        <?php
+        $opts = ['zemin'=>'Zemin','cam'=>'Cam','cop'=>'Çöp','toz'=>'Toz','dezenfeksiyon'=>'Dezenfeksiyon'];
+        foreach($opts as $k=>$v): ?>
+          <label class="chk">
+            <input type="checkbox" name="secimler[]" value="<?php echo h($k); ?>">
+            <span><?php echo h($v); ?></span>
+          </label>
+        <?php endforeach; ?>
+      </div>
+      <label style="display:block;font-size:13px;margin:8px 0 4px;">Açıklama</label>
+      <textarea name="aciklama" placeholder="Opsiyonel açıklama..."></textarea>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:15px;">
+        <div>
+          <label style="font-size:13px;">Fotoğraf 1 (Zorunlu)</label>
+          <input type="file" name="foto1" accept="image/*" capture="environment" required>
+        </div>
+        <div>
+          <label style="font-size:13px;">Fotoğraf 2 (Opsiyonel)</label>
+          <input type="file" name="foto2" accept="image/*" capture="environment">
+        </div>
+      </div>
+
+      <div style="margin-top:18px;" class="actions">
+        <button class="btn" type="submit">Kaydı Gönder</button>
+        <a class="btn danger" href="qr_form.php?cikis=1">Çıkış</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h1>Bana Atanan Açık Görevler</h1>
+    <?php if ($atananGorevlerHata): ?>
+      <div class="muted"><?php echo h($atananGorevlerHata); ?></div>
+    <?php endif; ?>
+    <?php if ($atananGorevler): ?>
+      <table class="table">
+        <thead><tr><th>ID</th><th>Başlık</th><?php if($hasOdaId): ?><th>Oda</th><?php endif; ?><?php if($hasDurum): ?><th>Durum</th><?php endif; ?><th>İşlem</th></tr></thead>
+        <tbody>
+        <?php foreach ($atananGorevler as $g): ?>
+          <tr>
+            <td><?php echo (int)$g['id']; ?></td>
+            <td><?php echo h($g['baslik'] ?? ('Görev #'.$g['id'])); ?></td>
+            <?php if($hasOdaId): ?><td><?php echo h($g['oda_ad'] ?? '-'); ?></td><?php endif; ?>
+            <?php if($hasDurum): ?><td><?php echo h($g['durum'] ?? '-'); ?></td><?php endif; ?>
+            <td class="actions">
+              <?php if(!$hasDurum || gorev_is_aktif($g['durum'] ?? null)): ?>
+                <a class="btn" href="<?php echo h(app_url('qr_gorevyap.php?g='.$g['id'])); ?>">İşlem Yap</a>
+              <?php else: ?>
+                <span class="small muted">Aktif değil</span>
+              <?php endif; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php elseif(!$atananGorevlerHata): ?>
+      <div class="small">Size atanmış açık görev bulunmuyor.</div>
+    <?php endif; ?>
+
+    <h1 style="margin-top:16px;">Bana Atanan Açık Şikayet Atamaları</h1>
+    <?php if ($atananSikayetlerHata): ?>
+      <div class="muted"><?php echo h($atananSikayetlerHata); ?></div>
+    <?php endif; ?>
+    <?php if ($atananSikayetler): ?>
+      <table class="table">
+        <thead><tr><th>ID</th><th>Başlık</th><th>Şikayet</th><?php if($hasOdaId): ?><th>Oda</th><?php endif; ?><?php if($hasDurum): ?><th>Durum</th><?php endif; ?><th>İşlem</th></tr></thead>
+        <tbody>
+        <?php foreach ($atananSikayetler as $sg): ?>
+          <tr>
+            <td><?php echo (int)$sg['id']; ?></td>
+            <td><?php echo h($sg['baslik'] ?? ''); ?></td>
+            <td><div class="small" style="max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><?php echo h($sg['sikayet_aciklama'] ?? '-'); ?></div></td>
+            <?php if($hasOdaId): ?><td><?php echo h($sg['oda_ad'] ?? '-'); ?></td><?php endif; ?>
+            <?php if($hasDurum): ?><td><?php echo h($sg['durum'] ?? '-'); ?></td><?php endif; ?>
+            <td class="actions">
+              <?php if(!$hasDurum || gorev_is_aktif($sg['durum'] ?? null)): ?>
+                <a class="btn" href="<?php echo h(app_url('qr_gorevyap.php?g='.$sg['id'])); ?>">İşlem Yap</a>
+              <?php else: ?>
+                <span class="small muted">Aktif değil</span>
+              <?php endif; ?>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php elseif(!$atananSikayetlerHata): ?>
+      <div class="small">Size atanmış açık şikayet yok.</div>
+    <?php endif; ?>
+  </div>
+
+  <div class="card">
+    <h1>Aktif Görevler (Odaya Ait)</h1>
+    <?php if ($gorevler): ?>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Başlık</th><?php if($hasDurum): ?><th>Durum</th><?php endif; ?><th>İşlem</th></tr></thead>
+      <tbody>
+      <?php foreach ($gorevler as $g): ?>
+        <tr>
+          <td><?php echo h($g['id']); ?></td>
+          <td><?php echo h($g['baslik']); ?></td>
+          <?php if($hasDurum): ?><td><?php echo h($g['durum']); ?></td><?php endif; ?>
+          <td>
+            <?php if(!$hasDurum || gorev_is_aktif($g['durum'] ?? null)): ?>
+              <a class="btn" href="<?php echo h(app_url('qr_gorevyap.php?g='.$g['id'])); ?>">İşlem Yap</a>
+            <?php else: ?>
+              <span class="small muted">Aktif değil</span>
+            <?php endif; ?>
+          </td>
+        </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+    <?php else: ?>
+      <p>Aktif görev yok.</p>
+    <?php endif; ?>
+  </div>
+
+  <div class="card">
+    <h1>Son Kayıtlar</h1>
+    <table class="table">
+      <thead><tr><th>ID</th><th>Tarih</th><th>İşaretler</th><th>Açıklama</th></tr></thead>
+      <tbody>
+      <?php foreach ($sonKayitlar as $sk): ?>
+        <tr>
+          <td><?php echo h($sk['id']); ?></td>
+          <td><?php echo h($sk['tarih']); ?></td>
+          <td>
+            <?php
+              if ($sk['isaretler']) {
+                  foreach (explode(',', $sk['isaretler']) as $tag) {
+                      $tag = trim($tag);
+                      if ($tag==='') continue;
+                      echo '<span class="badge">'.h($tag).'</span>';
+                  }
+              } else {
+                  echo '-';
+              }
+            ?>
+          </td>
+          <td><?php echo h($sk['aciklama']); ?></td>
+        </tr>
+      <?php endforeach; if(!$sonKayitlar): ?>
+        <tr><td colspan="4">Kayıt yok.</td></tr>
+      <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+    <div class="card">
+    <h1>
+  <a href="<?php echo h(app_url('sifre.php')); ?>" class="btn" style="background:#6c757d;">Şifre Değiştir</a>
+</h1>
+    
+  </div>
+</div>
+</body>
+</html>

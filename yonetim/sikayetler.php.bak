@@ -1,0 +1,92 @@
+<?php
+require_once __DIR__ . '/inc/header.php';
+
+// Arama ve sıralama (basit)
+$q = trim($_GET['q'] ?? '');
+$params = [];
+$where = " WHERE 1=1 ";
+if ($q !== '') {
+    $where .= " AND (s.baslik LIKE ? OR s.aciklama LIKE ?) ";
+    $like = "%$q%";
+    $params = [$like, $like];
+}
+
+$rows = fetch_all("
+  SELECT s.*,
+         o.ad AS oda_ad,
+         b.ad AS bina_ad,
+         k.ad AS kat_ad,
+         bi.ad AS birim_ad,
+         g.id AS gorev_id, g.durum AS gorev_durum,
+         u.ad AS atanan_ad, u.telefon AS atanan_tel
+  FROM sikayetler s
+  LEFT JOIN odalar o   ON o.id = s.oda_id
+  LEFT JOIN binalar b  ON b.id = o.bina_id
+  LEFT JOIN katlar k   ON k.id = o.kat_id
+  LEFT JOIN birimler bi ON bi.id = o.birim_id
+  LEFT JOIN gorevler g ON g.sikayet_id = s.id
+  LEFT JOIN kullanicilar u ON u.id = g.assigned_user_id
+  $where
+  ORDER BY s.id DESC
+", $params);
+?>
+<div class="card card-outline card-danger">
+  <div class="card-header">
+    <h3 class="card-title mb-0">Şikayetler</h3>
+    <div class="card-tools">
+      <form method="get" class="d-inline-block">
+        <div class="input-group input-group-sm" style="width:240px;">
+          <input type="text" name="q" class="form-control" placeholder="Ara (başlık/açıklama)" value="<?php echo h($q); ?>">
+          <button class="btn btn-outline-secondary btn-sm">Ara</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <div class="card-body table-responsive p-0">
+    <table class="table table-hover table-sm align-middle">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Başlık</th>
+          <th>Konum</th>
+          <th>Atanan</th>
+          <th>Görev Durumu</th>
+          <th style="width:120px;">İşlem</th>
+        </tr>
+      </thead>
+      <tbody>
+      <?php foreach($rows as $s): ?>
+        <tr>
+          <td><?php echo h($s['id']); ?></td>
+          <td>
+            <div><?php echo h($s['baslik'] ?? '-'); ?></div>
+            <?php if(!empty($s['aciklama'])): ?>
+              <div class="text-muted small"><?php echo h(mb_strimwidth($s['aciklama'],0,80,'…','UTF-8')); ?></div>
+            <?php endif; ?>
+          </td>
+          <td>
+            <?php echo h(($s['bina_ad']??'-')." / ".($s['kat_ad']??'-')." / ".(($s['birim_ad']??'-')?:'-')." / ".($s['oda_ad']??'-')); ?>
+          </td>
+          <td>
+            <?php if(!empty($s['atanan_ad'])): ?>
+              <?php echo h($s['atanan_ad']); ?>
+              <?php if(!empty($s['atanan_tel'])): ?>
+                <div class="text-muted small"><?php echo h($s['atanan_tel']); ?></div>
+              <?php endif; ?>
+            <?php else: ?>
+              <span class="text-muted">—</span>
+            <?php endif; ?>
+          </td>
+          <td><?php echo h($s['gorev_durum'] ?? '-'); ?></td>
+          <td>
+            <a class="btn btn-xs btn-warning" href="<?php echo h(app_url('yonetim/sikayet_atama.php?id='.$s['id'])); ?>">Ata</a>
+          </td>
+        </tr>
+      <?php endforeach; if(!$rows): ?>
+        <tr><td colspan="6" class="text-muted">Kayıt yok.</td></tr>
+      <?php endif; ?>
+      </tbody>
+    </table>
+  </div>
+</div>
+<?php require_once __DIR__ . '/inc/footer.php'; ?>

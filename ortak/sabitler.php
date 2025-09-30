@@ -1,0 +1,79 @@
+<?php
+declare(strict_types=1);
+
+if (!defined('BASE_INIT')) define('BASE_INIT', true);
+
+function base_path(string $path=''): string {
+    static $root;
+    if(!$root) $root = realpath(__DIR__ . '/..');
+    return $root . ($path?'/'.ltrim($path,'/'):'');
+}
+
+function load_env(string $path): void {
+    if(!file_exists($path)) return;
+    foreach(file($path, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) as $line){
+        $trim=trim($line);
+        if($trim==='' || $trim[0]==='#') continue;
+        $p=strpos($line,'=');
+        if($p===false) continue;
+        $k=trim(substr($line,0,$p));
+        $v=trim(substr($line,$p+1));
+        if(preg_match('/^"(.*)"$/',$v,$m) || preg_match("/^'(.*)'$/",$v,$m)) $v=$m[1];
+        if(!array_key_exists($k,$_ENV)){ $_ENV[$k]=$v; putenv("$k=$v"); }
+    }
+}
+load_env(base_path('.env'));
+
+function env(string $k, ?string $d=null): ?string {
+    $val=$_ENV[$k] ?? getenv($k);
+    return ($val===false||$val===null)?$d:$val;
+}
+
+function app_url(string $p=''): string {
+    $base=rtrim(env('APP_URL',''),'/');
+    if(!$base){
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS']!=='off')?'https':'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $scriptDir = dirname($_SERVER['SCRIPT_NAME'] ?? '/');
+        $base=rtrim($scheme.'://'.$host.$scriptDir,'/');
+    }
+    return $base . ($p?'/'.ltrim($p,'/'):'');
+}
+
+function absolute_url(string $url): string {
+    if(preg_match('#^https?://#i',$url)) return $url;
+    if($url==='' || $url[0]!=='/') $url='/'.$url;
+    return app_url(ltrim($url,'/'));
+}
+
+function h(?string $v): string { return htmlspecialchars($v??'',ENT_QUOTES,'UTF-8'); }
+
+function flash_init(): void { if(!isset($_SESSION['__flash'])) $_SESSION['__flash']=[]; }
+function flash_set(string $t,string $m): void { flash_init(); $_SESSION['__flash'][]=['t'=>$t,'m'=>$m]; }
+function flash_get_all(): array { flash_init(); $a=$_SESSION['__flash']; $_SESSION['__flash']=[]; return $a; }
+function redirect(string $u): void { header("Location: $u"); exit; }
+function request_method(): string { return $_SERVER['REQUEST_METHOD'] ?? 'GET'; }
+function is_post(): bool { return request_method()==='POST'; }
+function current_path(): string { $u=$_SERVER['REQUEST_URI']??'/'; $p=parse_url($u,PHP_URL_PATH); return $p?:'/'; }
+function random_str(int $bytes=16): string { return bin2hex(random_bytes($bytes)); }
+
+function generate_generic_qr_code(): string {
+    $lower='abcdefghijklmnopqrstuvwxyz';
+    $mix='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    $p1=''; for($i=0;$i<4;$i++) $p1.=$lower[random_int(0,25)];
+    $p2=''; for($i=0;$i<7;$i++) $p2.=$mix[random_int(0,strlen($mix)-1)];
+    return $p1.'-'.$p2;
+}
+if(!function_exists('generate_room_qr_code')){
+    function generate_room_qr_code(): string { return generate_generic_qr_code(); }
+}
+
+function ensure_upload_dir(): string {
+    $dir=rtrim(env('UPLOAD_DIR', base_path('uploads')),'/');
+    if(!is_dir($dir)) @mkdir($dir,0775,true);
+    return $dir;
+}
+function upload_url(string $file): string {
+    $base=rtrim(env('UPLOAD_URL',app_url('uploads')),'/');
+    return $base.'/'.ltrim($file,'/');
+}

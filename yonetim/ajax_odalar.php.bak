@@ -1,0 +1,29 @@
+<?php
+// Seçilen bina/kat/birim'e göre odaları JSON döner
+ob_start();
+require_once __DIR__ . '/inc/header.php'; // fonksiyonlar ve DB bağlantısı için
+ob_end_clean();
+
+header('Content-Type: application/json; charset=utf-8');
+
+try {
+    $binaId  = (int)($_GET['bina_id'] ?? 0);
+    $katId   = (int)($_GET['kat_id'] ?? 0);
+    $birimId = isset($_GET['birim_id']) && $_GET['birim_id'] !== '' ? (int)$_GET['birim_id'] : null;
+
+    if ($binaId <= 0 || $katId <= 0) {
+        echo json_encode(['ok'=>true, 'data'=>[]], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
+    $params = [$binaId, $katId];
+    $sql = "SELECT id, ad FROM odalar WHERE bina_id=? AND kat_id=?";
+    if ($birimId !== null) { $sql .= " AND birim_id=?"; $params[] = $birimId; }
+    $sql .= " ORDER BY ad";
+    $rows = fetch_all($sql, $params);
+
+    echo json_encode(['ok'=>true, 'data'=>$rows], JSON_UNESCAPED_UNICODE);
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false, 'error'=>$e->getMessage()], JSON_UNESCAPED_UNICODE);
+}

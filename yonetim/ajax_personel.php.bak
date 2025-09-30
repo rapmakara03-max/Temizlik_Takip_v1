@@ -1,0 +1,23 @@
+<?php
+// Personel arama için JSON uç
+ob_start();
+require_once __DIR__ . '/inc/header.php'; // fonksiyonlar ve DB bağlantısı için
+ob_end_clean();
+
+header('Content-Type: application/json; charset=utf-8');
+
+try {
+    $q = trim($_GET['q'] ?? '');
+    $params = [];
+    $where = " WHERE rol='PERSONEL' AND aktif=1 ";
+    if ($q !== '') {
+        $where .= " AND (ad LIKE ? OR email LIKE ? OR telefon LIKE ?) ";
+        $like = "%$q%";
+        $params = [$like, $like, $like];
+    }
+    $rows = fetch_all("SELECT id, ad, email, telefon, gorevi, sorumlu_bolge FROM kullanicilar $where ORDER BY ad LIMIT 20", $params);
+    echo json_encode(['ok'=>true, 'data'=>$rows], JSON_UNESCAPED_UNICODE);
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['ok'=>false, 'error'=>$e->getMessage()], JSON_UNESCAPED_UNICODE);
+}

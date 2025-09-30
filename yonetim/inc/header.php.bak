@@ -1,0 +1,136 @@
+<?php
+require_once __DIR__ . '/../../ortak/oturum.php';
+require_once __DIR__ . '/../../ortak/sabitler.php';
+require_once __DIR__ . '/../../ortak/yetki.php';
+require_once __DIR__ . '/../../ortak/csrf.php';
+require_once __DIR__ . '/../../ortak/db_helpers.php';
+require_once __DIR__ . '/../../ortak/form_helpers.php';
+
+require_role(['GENEL','MUDUR'], app_url('yonetim/login.php'));
+
+$script = basename($_SERVER['SCRIPT_NAME'] ?? '');
+$titleMap = [
+    'pano.php'=>'Pano',
+    'binalar.php'=>'Binalar',
+    'katlar.php'=>'Katlar',
+    'birimler.php'=>'Birimler',
+    'odalar.php'=>'Odalar',
+    'personel.php'=>'Personel',
+    'gorevler.php'=>'Görevler',
+    'sikayetler.php'=>'Şikayetler',
+    'raporlar.php'=>'Raporlar',
+    'temizlenmeyen_bugun.php'=>'Bugün Temizlenmeyen',
+    'islem_yapmayan_bugun.php'=>'İşlem Yapmayan Personel',
+    'rapor_temizlik_bina.php'=>'Bina Bazlı Rapor',
+    'rapor_temizlik_kat.php'=>'Kat Bazlı Rapor',
+    'rapor_temizlik_oda.php'=>'Oda Bazlı Rapor',
+    'rapor_temizlik_personel.php'=>'Temizlik Personel Detay',
+    'temizlik_bugun.php'=>'Bugün Temizlik',
+    'temizlik_detay.php'=>'Temizlik Detayı',
+    'gorev_detay.php'=>'Görev Detayı',
+    'personel_takip.php'=>'Personel Takip',
+    'personel_islemler.php'=>'Personel İşlemleri',
+    'qr_oda.php'=>'Oda QR',
+    'qr_kat.php'=>'Kat QR',
+    'qr_birim.php'=>'Birim QR',
+	'rapor_personel_bolgeler.php'=>'Personel Rapor',
+];
+$pageTitle = $titleMap[$script] ?? 'Yönetim Paneli';
+
+function nav_active(string $f): string {
+    return basename($_SERVER['SCRIPT_NAME']??'')===$f?' active ':'';
+}
+$user=current_user();
+?>
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title><?php echo h($pageTitle); ?> - Yönetim</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@5.15.4/css/all.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/admin-lte@3.2/dist/css/adminlte.min.css">
+<style>
+.nav-sidebar .nav-item>.nav-link.active{background:#007bff;color:#fff;}
+.badge.YENI{background:#0073b7;}
+.badge.DEVAM{background:#f39c12;}
+.badge.TAMAMLANDI{background:#00a65a;}
+.badge.IPTAL{background:#dd4b39;}
+.badge.INCELEME{background:#f39c12;}
+.badge.KAPANDI{background:#00a65a;}
+.table td,.table th{vertical-align:top;}
+</style>
+</head>
+<body class="hold-transition sidebar-mini layout-fixed">
+<div class="wrapper">
+<nav class="main-header navbar navbar-expand navbar-white navbar-light">
+  <ul class="navbar-nav">
+    <li class="nav-item"><a class="nav-link" data-widget="pushmenu" href="#"><i class="fas fa-bars"></i></a></li>
+    <li class="nav-item d-none d-sm-inline-block"><a href="<?php echo h(app_url('yonetim/pano.php')); ?>" class="nav-link">Ana Sayfa</a></li>
+  </ul>
+  <ul class="navbar-nav ml-auto">
+    <li class="nav-item dropdown">
+      <a class="nav-link" data-toggle="dropdown" href="#"><i class="far fa-user"></i> <?php echo h(($user['ad']??'').' ('.($user['rol']??'').')'); ?></a>
+      <div class="dropdown-menu dropdown-menu-right">
+        <a href="<?php echo h(app_url()); ?>" target="_blank" class="dropdown-item"><i class="fas fa-external-link-alt mr-2"></i> Portal</a>
+        <div class="dropdown-divider"></div>
+        <a href="<?php echo h(app_url('yonetim/logout.php')); ?>" class="dropdown-item text-danger"><i class="fas fa-sign-out-alt mr-2"></i> Çıkış</a>
+      </div>
+    </li>
+  </ul>
+</nav>
+<aside class="main-sidebar sidebar-dark-primary elevation-4">
+  <a href="<?php echo h(app_url('yonetim/pano.php')); ?>" class="brand-link">
+    <i class="fas fa-broom ml-2 mr-2"></i>
+    <span class="brand-text font-weight-light">Temizlik Yönetimi</span>
+  </a>
+  <div class="sidebar">
+    <nav class="mt-2">
+      <ul class="nav nav-pills nav-sidebar flex-column" data-widget="treeview" role="menu">
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/pano.php')); ?>" class="nav-link<?php echo nav_active('pano.php');?>"><i class="nav-icon fas fa-tachometer-alt"></i><p>Pano</p></a></li>
+        <li class="nav-header">TANIMLAR</li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/binalar.php')); ?>" class="nav-link<?php echo nav_active('binalar.php');?>"><i class="nav-icon fas fa-building"></i><p>Binalar</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/katlar.php')); ?>" class="nav-link<?php echo nav_active('katlar.php');?>"><i class="nav-icon fas fa-layer-group"></i><p>Katlar</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/birimler.php')); ?>" class="nav-link<?php echo nav_active('birimler.php');?>"><i class="nav-icon fas fa-sitemap"></i><p>Birimler</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/odalar.php')); ?>" class="nav-link<?php echo nav_active('odalar.php');?>"><i class="nav-icon fas fa-door-open"></i><p>Odalar</p></a></li>
+        <li class="nav-header">OPERASYON</li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/personel.php')); ?>" class="nav-link<?php echo nav_active('personel.php');?>"><i class="nav-icon fas fa-users"></i><p>Personel</p></a></li>
+		<li class="nav-item"><a href="<?php echo h(app_url('yonetim/rapor_personel_bolgeler.php')); ?>" class="nav-link<?php echo nav_active('rapor_personel_bolgeler.php');?>"><i class="nav-icon fas fa-users"></i><p>Personel Rapor</p></a></li>
+		
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/gorevler.php')); ?>" class="nav-link<?php echo nav_active('gorevler.php');?>"><i class="nav-icon fas fa-tasks"></i><p>Görevler</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/sikayetler.php')); ?>" class="nav-link<?php echo nav_active('sikayetler.php');?>"><i class="nav-icon fas fa-comment-dots"></i><p>Şikayetler</p></a></li>
+        <li class="nav-header">RAPORLAR</li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/raporlar.php')); ?>" class="nav-link<?php echo nav_active('raporlar.php');?>"><i class="nav-icon fas fa-chart-pie"></i><p>Raporlar</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/temizlenmeyen_bugun.php')); ?>" class="nav-link<?php echo nav_active('temizlenmeyen_bugun.php');?>"><i class="nav-icon fas fa-exclamation-triangle"></i><p>Temizlenmeyen</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/islem_yapmayan_bugun.php')); ?>" class="nav-link<?php echo nav_active('islem_yapmayan_bugun.php');?>"><i class="nav-icon fas fa-user-clock"></i><p>İşlem Yapmayan</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/personel_takip.php')); ?>" class="nav-link<?php echo nav_active('personel_takip.php');?>"><i class="nav-icon fas fa-user-friends"></i><p>Personel Takip</p></a></li>
+        <li class="nav-header">DİĞER</li>
+        <li class="nav-item"><a href="<?php echo h(app_url()); ?>" target="_blank" class="nav-link"><i class="nav-icon fas fa-external-link-alt"></i><p>Portal</p></a></li>
+        <li class="nav-item"><a href="<?php echo h(app_url('yonetim/logout.php')); ?>" class="nav-link text-danger"><i class="nav-icon fas fa-sign-out-alt"></i><p>Çıkış</p></a></li>
+      </ul>
+    </nav>
+  </div>
+</aside>
+<div class="content-wrapper">
+  <div class="content-header">
+    <div class="container-fluid">
+      <div class="row mb-2">
+        <div class="col-sm-6"><h1 class="m-0 text-dark"><?php echo h($pageTitle); ?></h1></div>
+        <div class="col-sm-6">
+          <ol class="breadcrumb float-sm-right">
+            <li class="breadcrumb-item"><a href="<?php echo h(app_url('yonetim/pano.php')); ?>">Pano</a></li>
+            <li class="breadcrumb-item active"><?php echo h($pageTitle); ?></li>
+          </ol>
+        </div>
+      </div>
+    </div>
+  </div>
+  <section class="content">
+    <div class="container-fluid">
+      <?php foreach(flash_get_all() as $f): ?>
+        <div class="alert alert-<?php echo $f['t']==='error'?'danger':h($f['t']); ?> alert-dismissible fade show" role="alert">
+          <?php echo h($f['m']); ?>
+          <button type="button" class="close" data-dismiss="alert"><span>&times;</span></button>
+        </div>
+      <?php endforeach; ?>
